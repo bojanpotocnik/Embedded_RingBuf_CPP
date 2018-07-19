@@ -9,16 +9,98 @@
  * statically allocated at compile time, so no heap memory is used. It can
  * buffer any fixed size object (ints, floats, structs, objects, etc...).
  *
- * @tparam Type        Type of the elements being stored.
- * @tparam MaxElements Maximum number of elements in this buffer. Note that
- *                     the allocated memory size will be at least
- *                     `MaxElements * sizeof(Type)`.
+ * @tparam T    Type of the elements.
+ *              Aliased as member type RingBufCPP::value_type.
+ * @tparam Size The maximum number of elements buffer can hold as content.
+ *              Note that the allocated memory size will be at least
+ *              `Size * sizeof(T)`.
  */
-template<typename Type, size_t MaxElements>
+template<typename T, size_t Size>
 class RingBufCPP {
 public:
+    /** Type of the elements (the first template parameter, `T`). */
+    typedef T value_type;
+    /** An unsigned integral type that can represent any non-negative value. */
+    typedef size_t size_type;
 
+    /** Construct the ring/circular buffer. */
     RingBufCPP() {
+        clear();
+    }
+
+    // Prevent copying and moving instances by deleting copy/move
+    // constructors and assignment operators.
+
+    /** Copy constructor. */
+    RingBufCPP(const RingBufCPP &other) noexcept = delete;
+
+    /** Move constructor. */
+    RingBufCPP(RingBufCPP &&other) noexcept = delete;
+
+    /** Copy assignment operator. */
+    RingBufCPP &operator=(const RingBufCPP &other) noexcept = delete;
+
+    /** Move assignment operator. */
+    RingBufCPP &operator=(RingBufCPP &&other) noexcept = delete;
+
+    // Disable heap (dynamic) allocation by deleting `new`/`delete` operators.
+
+    void *operator new(size_t) = delete;
+
+    void *operator new[](size_t) = delete;
+
+    void operator delete(void *) = delete;
+
+    void operator delete[](void *) = delete;
+
+
+    // Capacity (size, max_size, [resize], empty, [shrink_to_fit])
+
+    /**
+     * @return The maximum number of elements this buffer can hold at the same
+     *         time.
+     */
+    static constexpr size_type max_size() noexcept {
+        return Size;
+    }
+
+    /**
+     * @return The number of elements currently in the buffer.
+     */
+    constexpr size_type size() const noexcept {
+        return _numElements;
+    }
+
+    /**
+     * Test whether this buffer is empty.
+     *
+     * @return true where are no elements in the buffer (`size() == 0`),
+     *         false otherwise.
+     */
+    constexpr bool empty() const noexcept {
+        return size() == 0;
+    }
+
+    /**
+     * Test whether this buffer is full.
+     *
+     * @return true when the buffer is full (`size() == max_size()`).
+     */
+    constexpr bool full() const noexcept {
+        return size() >= max_size();
+    }
+
+    // Element access (operator[], at, front, back)
+    // Not implemented as they return references (which cannot be nullptr)
+    // or throw exceptions (not supported).
+
+    // Modifiers (assign, push, pop, insert, erase, swap, clear)
+
+    /**
+     * Removes all elements from the buffer, effectively setting its size to 0.
+     * The buffer will be empty after this call returns.
+     */
+    void clear() noexcept {
         RB_ATOMIC_START
             {
                 _numElements = 0;
@@ -28,21 +110,34 @@ public:
     }
 
     /**
-     *  Add an element to the buffer.
+     *  Add a new element to the buffer via copy/move, optionally removing the
+     *  oldest if the buffer is full.
      *
-     *  @param obj[in] The element to add.
+     *  This effectively increases the buffer size by one.
+     *
+     *  @param obj   The element to add.
+     *  @param force If true, then the new object is always added to the
+     *               buffer even if the buffer is full - by discarding the
+     *               oldest (first added) object.
      *
      *  @return true on success.
      */
-    bool add(const Type &obj) {
+    bool push(const value_type &obj, bool force = false) noexcept {
         bool ret = false;
 
         RB_ATOMIC_START
             {
-                if (!isFull()) {
-                    _buf[_head] = obj;
-                    _head = (_head + 1) % MaxElements;
-                    _numElements++;
+                const bool space = !full();
+
+                if (space || force) {
+                    _buf[_head++] = obj;
+                    // Wrap around if the end of the array was reached.
+                    if (_head >= max_size()) {
+                        _head = 0;
+                    }
+                    if (space) {
+                        _numElements++;
+                    }
 
                     ret = true;
                 }
@@ -52,24 +147,56 @@ public:
         return ret;
     }
 
+    /**
+     * @see push(obj, force)
+     */
+    bool add(const value_type &obj, bool force = false) noexcept {
+        return push(obj, force);
+    }
 
     /**
-     * Remove last element from buffer, and copy it to destination.
+     * Retrieves, but does not remove, the n'th element in the buffer.
      *
-     * @param dest[out] Pointer on the allocated object to which removed element
-     *                  will be copied.
+     * @param index Index of the element to peek at. As this is FIFO buffer,
+     *              the oldest element in the buffer is always at index 0 and
+     *              the last added one is at the index `size() - 1`.
      *
-     * @return true on success.
+     * @return A pointer to the index'th element or `nullptr` if there is less
+     *         elements currently in the buffer than provided index.
      */
-    bool pull(Type *dest) {
-        bool ret = false;
-        size_t tail;
+    value_type *peek(size_type index = 0) noexcept {
+        value_type *ret = nullptr;
 
         RB_ATOMIC_START
             {
-                if (!isEmpty()) {
-                    tail = getTail();
-                    *dest = _buf[tail];
+                // Make sure not out of bounds.
+                if (index < size()) {
+                    // TODO: Replace modulus operator with decision logic as in tail_index()
+                    ret = &_buf[(tail_index() + index) % max_size()];
+                }
+            }
+        RB_ATOMIC_END
+
+        return ret;
+    }
+
+    /**
+     * Retrieves and removes the oldest element in the buffer and copies it to
+     * the destination.
+     *
+     * @param destination[out] Allocated object to which removed element will
+     *                         be copied. If the buffer is empty (false is
+     *                         returned), this object will not be altered.
+     *
+     * @return true on success, false if buffer is empty.
+     */
+    bool poll(value_type &destination) noexcept {
+        bool ret = false;
+
+        RB_ATOMIC_START
+            {
+                if (!empty()) {
+                    destination = _buf[tail_index()];
                     _numElements--;
 
                     ret = true;
@@ -80,95 +207,64 @@ public:
         return ret;
     }
 
-
     /**
-     * Peek at n'th element in the buffer.
+     * The same functionality as poll() except the object is simply discarded.
      *
-     * @param num Index of the element to peek at. As this is FIFO buffer, the
-     *            oldest element in the buffer is always at index 0 and the
-     *            last added one is at the index `numElements() - 1`.
+     * @see poll(destination)
+     */
+    bool poll() noexcept {
+        bool ret = false;
+
+        RB_ATOMIC_START
+            {
+                if (!empty()) {
+                    _numElements--;
+
+                    ret = true;
+                }
+            }
+        RB_ATOMIC_END
+
+        return ret;
+    }
+
+    /**
+     * Retrieves and removes the oldest element in the buffer and copies it to
+     * the destination.
      *
-     * @return A pointer to the num'th element or `nullptr` if there is less
-     *         elements currently in the buffer than provided index.
+     * @param destination[out] Pointer on the allocated object to which removed
+     *                         element will be copied. If the buffer is empty
+     *                         (false is returned), this object will not be
+     *                         altered. If `nullptr` then the element is simply
+     *                         discarded.
+     *
+     * @return true on success, false if buffer is empty.
      */
-    Type *peek(size_t num) {
-        Type *ret = nullptr;
-
-        RB_ATOMIC_START
-            {
-                if (num < _numElements) //make sure not out of bounds
-                    ret = &_buf[(getTail() + num) % MaxElements];
-            }
-        RB_ATOMIC_END
-
-        return ret;
-    }
-
-
-    /**
-     * @return true if buffer is full.
-     */
-    bool isFull() const {
-        bool ret;
-
-        RB_ATOMIC_START
-            {
-                ret = _numElements >= MaxElements;
-            }
-        RB_ATOMIC_END
-
-        return ret;
-    }
-
-
-    /**
-     * @return number of elements currently in buffer.
-     */
-    size_t numElements() const {
-        size_t ret;
-
-        RB_ATOMIC_START
-            {
-                ret = _numElements;
-            }
-        RB_ATOMIC_END
-
-        return ret;
-    }
-
-
-    /**
-     * @return true if buffer is empty.
-     */
-    bool isEmpty() const {
-        bool ret;
-
-        RB_ATOMIC_START
-            {
-                ret = !_numElements;
-            }
-        RB_ATOMIC_END
-
-        return ret;
+    bool pull(value_type *const destination = nullptr) noexcept {
+        return (destination ? poll(*destination) : poll());
     }
 
 protected:
+
     /**
      * Calculates the index of the oldest element in the array.
      *
-     * @return index of the element in array.
+     * @return index of the oldest element in the array.
      */
-    size_t getTail() const {
-        return (_head + (MaxElements - _numElements)) % MaxElements;
+    constexpr size_t tail_index() const {
+        return (full() ? _head
+                       : (_head >= _numElements ? _head - _numElements
+                                                : max_size() + _head - _numElements));
     }
 
 
     /** Underlying array. */
-    Type _buf[MaxElements];
+    value_type _buf[Size];
 
-    size_t _head;
-    size_t _numElements;
-private:
+    /** Index of the next element slot in the underlying buffer. */
+    size_type _head;
+    /** @see size() */
+    size_type _numElements;
 
 };
 
